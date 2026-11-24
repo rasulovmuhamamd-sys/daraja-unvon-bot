@@ -1,8 +1,11 @@
 import asyncio
+import io
 import logging
 import os
 import re
 import sqlite3
+import zipfile
+from datetime import datetime
 from html import escape
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -12,10 +15,15 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+)
+from docx import Document
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Pt
 
 # ================== SOZLAMALAR ==================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "9238576370:AAGTJOQbJgL3hSTXMQXHRB_Q80S_475mXEw")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 ADMINS = [5137395017, 399336424, 8320070405, 8576050673]
 
@@ -176,6 +184,65 @@ def app_text(a, status_line=""):
     return t
 
 
+def safe_name(text: str) -> str:
+    return re.sub(r"[^\w]+", "_", text, flags=re.UNICODE).strip("_") or "ariza"
+
+
+def build_docx(a) -> bytes:
+    """Foydalanuvchi to'ldirgan ma'lumotlardan Word (docx) ariza yaratadi."""
+    doc = Document()
+    style = doc.styles["Normal"]
+    style.font.name = "Times New Roman"
+    style.font.size = Pt(13)
+
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    p.add_run("Qo'qon universiteti\nIlmiy kengashiga").bold = True
+
+    h = doc.add_paragraph()
+    h.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    r = h.add_run(f"ARIZA №{a['id']}")
+    r.bold = True
+    r.font.size = Pt(16)
+
+    fio = f"{a['familya']} {a['ism']} {a['otasi']}"
+    rows = [
+        ("F.I.Sh.", fio),
+        ("Ariza turi", a["tur"]),
+        ("Tanlangan daraja / unvon", a["unvon"]),
+        ("Ishlayotgan kafedra", a["kafedra"]),
+        ("Diplom raqami", a["diplom"]),
+        ("Diplom berilgan sana", a["sana"]),
+        ("Bayon nomi va raqami", a["bayon"]),
+        ("Telegram", f"@{a['username']}" if a["username"] else "-"),
+    ]
+    table = doc.add_table(rows=0, cols=2)
+    table.style = "Table Grid"
+    for k, v in rows:
+        cells = table.add_row().cells
+        cells[0].text = k
+        cells[1].text = str(v)
+        for run in cells[0].paragraphs[0].runs:
+            run.bold = True
+
+    doc.add_paragraph()
+    doc.add_paragraph(f"Ariza topshirilgan sana: {datetime.now():%d.%m.%Y}")
+    doc.add_paragraph("Imzo: ____________________")
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def build_zip(a, pdf_bytes: bytes) -> bytes:
+    base = f"{safe_name(a['familya'])}_{safe_name(a['ism'])}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(f"Ariza_{base}.docx", build_docx(a))
+        z.writestr(f"Diplom_{base}.pdf", pdf_bytes)
+    return buf.getvalue()
+
+
 async def start_form(msg: Message, state: FSMContext):
     await state.clear()
     await state.set_state(Form.ism)
@@ -312,6 +379,19 @@ async def f_pdf(msg: Message, state: FSMContext, bot: Bot):
     if not is_pdf:
         await msg.answer("❗️ Faqat <b>PDF</b> fayl qabul qilinadi. Qaytadan yuboring.")
         return
+    if d.file_size and d.file_size > 20 * 1024 * 1024:
+        await msg.answer("❗️ Fayl hajmi 20 MB dan oshmasligi kerak. Kichikroq PDF yuboring.")
+        return
+
+    # PDF ni yuklab olamiz
+    try:
+        pdf_buf = io.BytesIO()
+        await bot.download(d, destination=pdf_buf)
+        pdf_bytes = pdf_buf.getvalue()
+    except Exception as e:
+        logging.exception("PDF yuklab olinmadi: %s", e)
+        await msg.answer("❗️ Faylni qabul qilib bo'lmadi. Qaytadan yuboring.")
+        return
 
     data = await state.get_data()
     await state.clear()
@@ -331,17 +411,22 @@ async def f_pdf(msg: Message, state: FSMContext, bot: Bot):
         app_id = cur.lastrowid
     a = get_app(app_id)
 
-    # Foydalanuvchiga nusxa
-    await msg.answer_document(
-        d.file_id,
+    # Word + PDF -> ZIP
+    zip_name = f"{safe_name(a['familya'])}_{safe_name(a['ism'])}.zip"
+    zip_file = BufferedInputFile(build_zip(a, pdf_bytes), filename=zip_name)
+
+    # Foydalanuvchiga nusxa (ZIP bir marta yuklanadi, keyin file_id qayta ishlatiladi)
+    sent_user = await msg.answer_document(
+        zip_file,
         caption=app_text(a, "⏳ Arizangiz adminlarga yuborildi. Natija haqida xabar beramiz."),
     )
+    zip_id = sent_user.document.file_id
 
     # 4 ta adminga
     for admin_id in ADMINS:
         try:
             sent = await bot.send_document(
-                admin_id, d.file_id, caption=app_text(a), reply_markup=admin_kb(app_id)
+                admin_id, zip_id, caption=app_text(a), reply_markup=admin_kb(app_id)
             )
             with db() as con:
                 con.execute(
@@ -473,3 +558,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
